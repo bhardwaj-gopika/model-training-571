@@ -29,17 +29,22 @@ from pv_mapping import (
     machine_input_names,
     ordered_pv_mapping,
 )
+from lume_model_utils import CovMeanTorchModel, CovMeanTorchModule
 
 
 PHASE_SPACE_LABELS = ["x", "px", "y", "py", "t", "pz"]
-PHASE_SPACE_UNITS = ["m", "rad", "m", "rad", "s", "eV/c"]
+PHASE_SPACE_UNITS = ["m", "eV/c", "m", "eV/c", "s", "eV/c"]
 
 # M-normalization matrix: brings (x, px, y, py, t, pz) to comparable scales
 M_DIAG = np.array([1e3, 1e-6, 1e3, 1e-6, 1e12, 1e-6])
 M = np.diag(M_DIAG)
 
 
-def load_lume_model(yaml_path: str) -> TorchModule:
+def load_lume_model(yaml_path: str, full: bool = False):
+    """Load a lume-torch model. Use full=True for models with mean outputs."""
+    if full:
+        torch_model = CovMeanTorchModel(yaml_path)
+        return CovMeanTorchModule(model=torch_model)
     torch_model = TorchModel(yaml_path)
     return TorchModule(model=torch_model)
 
@@ -50,6 +55,15 @@ def gt_covariance_from_h5(h5_path: str, normalize: bool = False) -> np.ndarray:
     if normalize:
         cov = M @ cov @ M.T
     return cov
+
+
+def gt_means_from_h5(h5_path: str) -> dict:
+    """Extract all 6 phase-space means from an h5 particle file."""
+    beam = ParticleGroup(h5=h5_path)
+    return {
+        f"mean_{var}": float(beam.avg(var))
+        for var in PHASE_SPACE_LABELS
+    }
 
 
 def draw_2d_ellipse(ax, cov_2x2, mean=(0, 0), n_std=2.0, **kwargs):
@@ -201,11 +215,14 @@ def plot_covariance_scatter_grid(
         ax.plot([lo, hi], [lo, hi], "r--", linewidth=0.8)
 
         r2 = float(np.corrcoef(t, p)[0, 1] ** 2) if t.std() > 0 else float("nan")
-        label = f"cov({PHASE_SPACE_LABELS[row]},{PHASE_SPACE_LABELS[col]})"
+        unit_r = PHASE_SPACE_UNITS[row]
+        unit_c = PHASE_SPACE_UNITS[col]
+        unit_str = f"{unit_r}·{unit_c}" if unit_r != unit_c else f"{unit_r}²"
+        label = f"cov({PHASE_SPACE_LABELS[row]},{PHASE_SPACE_LABELS[col]}) [{unit_str}]"
         ax.set_title(f"{label}\n$R^2$={r2:.3f}", fontsize=7)
         ax.tick_params(labelsize=5)
-        ax.set_xlabel("True", fontsize=5)
-        ax.set_ylabel("Predicted", fontsize=5)
+        ax.set_xlabel(f"True [{unit_str}]", fontsize=5)
+        ax.set_ylabel(f"Predicted [{unit_str}]", fontsize=5)
 
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(output_path, dpi=150)
@@ -254,8 +271,8 @@ def build_parser():
         )
     )
     p.add_argument(
-        "--lume-yaml", default="lumetorchyaml-machine/injector_machine.yaml",
-        help="Path to lume-torch YAML config (default: lumetorchyaml-machine/injector_machine.yaml)",
+        "--lume-yaml", default="lumetorchyaml-machine-full/injector_machine.yaml",
+        help="Path to lume-torch YAML config. Use the full model YAML to compare means as well (default: lumetorchyaml-machine-full/injector_machine.yaml)",
     )
     p.add_argument(
         "--dump-csv", default="particles-571.csv",
@@ -314,10 +331,36 @@ def main():
 
     # ── Load lume-torch model ──────────────────────────────────────────────────
     print(f"[run] Loading lume-torch model from {args.lume_yaml}", flush=True)
-    lume_model = load_lume_model(args.lume_yaml)
+
+    # Auto-detect full model (has mean phase-space outputs) vs cov-only
+    import yaml
+    with open(args.lume_yaml) as f:
+        yaml_cfg = yaml.safe_load(f)
+    output_names = list(yaml_cfg.get("output_variables", {}).keys())
+    mean_output_names = [f"mean_{v}" for v in PHASE_SPACE_LABELS]
+    has_all_means = all(name in output_names for name in mean_output_names)
+
+    if not has_all_means:
+        # Check for legacy mean_energy/mean_time outputs
+        has_legacy_means = "mean_energy" in output_names or "mean_time" in output_names
+        if has_legacy_means:
+            raise SystemExit(
+                "[error] The lume-torch YAML has legacy mean outputs (mean_energy/mean_time) "
+                "instead of the 6 phase-space means (mean_x, mean_px, ..., mean_pz). "
+                "Re-run infer_covariance.py to regenerate the YAML with the updated model."
+            )
+
+    is_full_model = has_all_means
+
+    if is_full_model:
+        print("[run] Detected full model (covariance + phase-space means)", flush=True)
+        lume_model = load_lume_model(args.lume_yaml, full=True)
+    else:
+        print("[run] Detected covariance-only model", flush=True)
+        lume_model = load_lume_model(args.lume_yaml, full=False)
 
     # Extract input PV names from the lume-torch model config
-    lume_torch_model = TorchModel(args.lume_yaml)
+    lume_torch_model = CovMeanTorchModel(args.lume_yaml) if is_full_model else TorchModel(args.lume_yaml)
     pv_cols = lume_torch_model.input_names
 
     # Map PV names back to sim feature columns via the pv_mapping
@@ -377,23 +420,37 @@ def main():
     pred_batches = []
     with torch.no_grad():
         for (X_batch,) in loader:
-            pred_cov = lume_model(X_batch.to(device)).cpu().numpy()
-            pred_batches.append(pred_cov)
+            out = lume_model(X_batch.to(device)).cpu().numpy()
+            pred_batches.append(out)
 
-    pred_covs = np.concatenate(pred_batches, axis=0)  # (N, 6, 6)
-    print(f"[run] Predicted covariance shape: {pred_covs.shape}", flush=True)
+    all_preds = np.concatenate(pred_batches, axis=0)
+
+    n_mean_outputs = len(PHASE_SPACE_LABELS)  # 6
+    if is_full_model:
+        # Full model returns flat (N, 42): first 36 = cov, last 6 = means
+        pred_covs = all_preds[:, :36].reshape(-1, 6, 6)
+        pred_means = all_preds[:, 36:36 + n_mean_outputs]  # (N, 6)
+        print(f"[run] Predicted covariance shape: {pred_covs.shape}", flush=True)
+        print(f"[run] Predicted {n_mean_outputs} phase-space means for {len(all_preds)} samples", flush=True)
+    else:
+        pred_covs = all_preds  # (N, 6, 6)
+        pred_means = None
+        print(f"[run] Predicted covariance shape: {pred_covs.shape}", flush=True)
 
     # ── Ground truth from bmad_final_particles h5 files ───────────────────────
-    print(f"[run] Loading ground-truth covariances from {particles_col} h5 files ...", flush=True)
+    print(f"[run] Loading ground-truth covariances and means from {particles_col} h5 files ...", flush=True)
     h5_paths = df_valid[particles_col].tolist()
     true_covs_list = []
+    true_means_list = []
     valid_indices = []
     for i, h5_path in enumerate(h5_paths):
         if (i + 1) % 100 == 0:
             print(f"  ... {i + 1}/{len(h5_paths)}", flush=True)
         try:
             cov = gt_covariance_from_h5(h5_path, normalize=args.normalize)
+            means = gt_means_from_h5(h5_path)
             true_covs_list.append(cov)
+            true_means_list.append(means)
             valid_indices.append(i)
         except Exception as exc:
             print(f"  [warn] Failed {h5_path}: {exc}")
@@ -405,6 +462,8 @@ def main():
     )
 
     true_covs = np.stack(true_covs_list)  # (N_valid, 6, 6)
+    mean_col_names = [f"mean_{v}" for v in PHASE_SPACE_LABELS]
+    true_means = np.array([[m[col] for col in mean_col_names] for m in true_means_list])  # (N_valid, 6)
     pred_covs_valid = pred_covs[valid_indices]
     X_machine_valid = X_machine[valid_indices]
 
@@ -458,6 +517,68 @@ def main():
     print(f"[plot] Saved {len(ellipse_indices)} ellipse plots to {ellipse_dir}", flush=True)
     print(f"[plot] Saved {len(ellipse_indices)} heatmap plots to {heatmap_dir}", flush=True)
 
+    # ── Mean phase-space comparison plots ────────────────────────────────────────
+    has_mean_preds = pred_means is not None
+    if has_mean_preds:
+        pred_means_valid = pred_means[valid_indices]
+
+        # Scatter plots for all 6 phase-space means
+        fig, axes = plt.subplots(2, 3, figsize=(21, 12))
+        fig.suptitle("Mean Phase-Space Property Comparison (571 Model)", fontsize=13)
+        axes_flat = axes.flatten()
+
+        for idx, (var, ax) in enumerate(zip(PHASE_SPACE_LABELS, axes_flat)):
+            col_name = f"mean_{var}"
+            unit = PHASE_SPACE_UNITS[idx]
+            true_vals = true_means[:, idx]
+            pred_vals = pred_means_valid[:, idx]
+            ax.scatter(true_vals, pred_vals, s=6, alpha=0.4, rasterized=True)
+            lo = min(true_vals.min(), pred_vals.min())
+            hi = max(true_vals.max(), pred_vals.max())
+            margin = (hi - lo) * 0.05 if hi > lo else 1e-10
+            ax.plot([lo - margin, hi + margin], [lo - margin, hi + margin], "r--", linewidth=0.8)
+            r2 = float(np.corrcoef(true_vals, pred_vals)[0, 1] ** 2) if true_vals.std() > 0 else float("nan")
+            mae = float(np.mean(np.abs(true_vals - pred_vals)))
+            ax.set_title(f"{col_name}\n$R^2$={r2:.4f}  MAE={mae:.4e} {unit}", fontsize=10)
+            ax.set_xlabel(f"True ({unit})", fontsize=9)
+            ax.set_ylabel(f"Predicted ({unit})", fontsize=9)
+            ax.set_aspect("equal")
+            ax.tick_params(labelsize=7)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        mean_scatter_path = output_dir / "mean_scatter.png"
+        fig.savefig(mean_scatter_path, dpi=150)
+        plt.close(fig)
+        print(f"[plot] Saved: {mean_scatter_path}", flush=True)
+
+        # ── Mean residual histograms ───────────────────────────────────────────
+        fig, axes = plt.subplots(2, 3, figsize=(21, 10))
+        fig.suptitle("Mean Beam Prediction Residuals (Predicted - True)", fontsize=13)
+        axes_flat = axes.flatten()
+
+        for idx, (var, ax) in enumerate(zip(PHASE_SPACE_LABELS, axes_flat)):
+            col_name = f"mean_{var}"
+            unit = PHASE_SPACE_UNITS[idx]
+            true_vals = true_means[:, idx]
+            pred_vals = pred_means_valid[:, idx]
+            residuals = pred_vals - true_vals
+            ax.hist(residuals, bins=50, alpha=0.7, edgecolor="black", linewidth=0.5)
+            ax.axvline(0, color="red", linewidth=1, linestyle="--")
+            ax.set_title(f"{col_name} Residuals", fontsize=10)
+            ax.set_xlabel(f"Residual ({unit})", fontsize=9)
+            ax.set_ylabel("Count", fontsize=9)
+            mean_res = np.mean(residuals)
+            std_res = np.std(residuals)
+            ax.text(0.02, 0.95, f"μ={mean_res:.3e}\nσ={std_res:.3e}",
+                    transform=ax.transAxes, fontsize=8, va="top", family="monospace")
+            ax.tick_params(labelsize=7)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        residual_path = output_dir / "mean_residuals.png"
+        fig.savefig(residual_path, dpi=150)
+        plt.close(fig)
+        print(f"[plot] Saved: {residual_path}", flush=True)
+
     # ── Summary statistics ─────────────────────────────────────────────────────
     true_flat = true_covs.reshape(-1, 36)
     pred_flat = pred_covs_valid.reshape(-1, 36)
@@ -475,6 +596,19 @@ def main():
         mae = float(np.mean(np.abs(t - p)))
         rmse = float(np.sqrt(np.mean((t - p) ** 2)))
         print(f"{label:<20}  {r2:>8.4f}  {mae:>14.4e}  {rmse:>14.4e}")
+
+    if has_mean_preds:
+        print()
+        pred_means_valid = pred_means[valid_indices]
+        for idx, var in enumerate(PHASE_SPACE_LABELS):
+            label = f"mean_{var}"
+            unit = PHASE_SPACE_UNITS[idx]
+            true_vals = true_means[:, idx]
+            pred_vals = pred_means_valid[:, idx]
+            r2 = float(np.corrcoef(true_vals, pred_vals)[0, 1] ** 2) if true_vals.std() > 0 else float("nan")
+            mae = float(np.mean(np.abs(true_vals - pred_vals)))
+            rmse = float(np.sqrt(np.mean((true_vals - pred_vals) ** 2)))
+            print(f"{label:<20}  {r2:>8.4f}  {mae:>14.4e}  {rmse:>14.4e}")
 
     print(f"\n[run] All outputs saved to {output_dir}", flush=True)
 

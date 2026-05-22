@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from train import build_model, chol_vectors_to_covariance
 
-MEAN_TARGET_COLS = ["mean_energy", "mean_time"]
+PHASE_SPACE_VARS = ["x", "px", "y", "py", "t", "pz"]
+MEAN_TARGET_COLS = [f"mean_{v}" for v in PHASE_SPACE_VARS]
 
 
 def load_model_and_transformers(model_dir: Path):
@@ -577,10 +578,12 @@ def main():
         print(f"[run] Mean beam metrics saved to {output_dir}/mean_beam_metrics.csv", flush=True)
 
         # Scatter plots for mean beam outputs
-        fig, axes = plt.subplots(1, len(mean_cols), figsize=(7 * len(mean_cols), 6))
-        if len(mean_cols) == 1:
-            axes = [axes]
-        for idx, (col, ax) in enumerate(zip(mean_cols, axes)):
+        n_mean = len(mean_cols)
+        ncols = min(n_mean, 3)
+        nrows = (n_mean + ncols - 1) // ncols
+        fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 6 * nrows))
+        axes_flat = np.atleast_1d(axes).flatten()
+        for idx, (col, ax) in enumerate(zip(mean_cols, axes_flat)):
             tgt = test_mean_raw[:, idx]
             prd = preds_mean[:, idx]
             ax.scatter(tgt, prd, s=8, color="steelblue", alpha=0.5)
@@ -593,6 +596,8 @@ def main():
             ax.set_xlabel("True")
             ax.set_ylabel("Predicted")
             ax.grid(True, alpha=0.3)
+        for ax in axes_flat[n_mean:]:
+            ax.set_visible(False)
         plt.tight_layout()
         plt.savefig(output_dir / "mean_beam_scatter.png", dpi=150)
         print(f"[run] Mean beam scatter plot saved to {output_dir}/mean_beam_scatter.png", flush=True)

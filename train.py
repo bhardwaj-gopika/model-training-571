@@ -13,7 +13,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 # ── Column definitions ────────────────────────────────────────────────────────
 TARGET_PREFIX = "cov_chol_"
-MEAN_TARGET_COLS = ["mean_energy", "mean_time"]
+PHASE_SPACE_VARS = ["x", "px", "y", "py", "t", "pz"]
+MEAN_TARGET_COLS = [f"mean_{v}" for v in PHASE_SPACE_VARS]
 
 
 def get_feature_target_columns(df: pd.DataFrame):

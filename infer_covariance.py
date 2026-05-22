@@ -23,26 +23,14 @@ from pv_mapping import (
     machine_to_sim_array,
     sim_to_machine_array,
 )
-
-
-# M-normalization diagonal used during training.
-# The model predicts covariance in M-normalized space; this converts to physical units.
-M_DIAG = torch.tensor([1e3, 1e-6, 1e3, 1e-6, 1e12, 1e-6], dtype=torch.float32)
-
-
-class CovarianceDenormTransform(torch.nn.Module):
-    """Output transformer: M-normalized covariance -> physical units.
-
-    Applies C_phys = M_inv @ C_norm @ M_inv^T where M = diag(M_DIAG).
-    """
-
-    def __init__(self, m_diag: torch.Tensor = M_DIAG):
-        super().__init__()
-        self.register_buffer("m_inv_diag", 1.0 / m_diag)
-
-    def forward(self, cov: torch.Tensor) -> torch.Tensor:
-        m_inv = torch.diag(self.m_inv_diag)
-        return m_inv @ cov @ m_inv.T
+from lume_model_utils import (
+    CovOnlyWrapper,
+    CovMeanTorchModel,
+    CovMeanTorchModule,
+    CovarianceDenormTransform,
+    FullOutputDenormTransform,
+    M_DIAG,
+)
 
 
 def covariance_labels():
@@ -155,8 +143,12 @@ def resolve_input_space(df: pd.DataFrame, feature_cols, requested_space: str):
     )
 
 
-def create_lume_torch_sim(model, input_tr, dump_dir="lumetorchyaml-sim"):
-    """Create LUME-torch model that takes simulator-parameter inputs."""
+def create_lume_torch_sim(model, input_tr, mean_cols=None, dump_dir="lumetorchyaml-sim"):
+    """Create LUME-torch model that takes simulator-parameter inputs.
+
+    If mean_cols is provided, creates a full model with NDVariable covariance_matrix(6,6)
+    + scalar mean outputs using CovMeanTorchModel. Otherwise creates a cov-only model.
+    """
     feature_cols = list(input_tr["feature_cols"])
     x_mean = input_tr["x_mean"].to(dtype=torch.float32)
     x_std = input_tr["x_std"].to(dtype=torch.float32)
@@ -165,31 +157,51 @@ def create_lume_torch_sim(model, input_tr, dump_dir="lumetorchyaml-sim"):
         TorchScalarVariable(name=col, default_value=float(x_mean[idx]))
         for idx, col in enumerate(feature_cols)
     ]
-    output_variables = [TorchNDVariable(name="covariance_matrix", shape=(6, 6))]
 
     normalization_transform = AffineInputTransform(
         d=len(feature_cols), coefficient=x_std, offset=x_mean
     )
 
-    denorm_transform = CovarianceDenormTransform(M_DIAG)
-
-    torch_model = TorchModel(
-        model=model,
-        input_variables=input_variables,
-        output_variables=output_variables,
-        input_transformers=[normalization_transform],
-        output_transformers=[denorm_transform],
-        precision="single",
-    )
+    if mean_cols:
+        output_variables = [
+            TorchNDVariable(name="covariance_matrix", shape=(6, 6)),
+            *[TorchScalarVariable(name=col) for col in mean_cols],
+        ]
+        denorm_transform = FullOutputDenormTransform(M_DIAG)
+        torch_model = CovMeanTorchModel(
+            model=model,
+            input_variables=input_variables,
+            output_variables=output_variables,
+            input_transformers=[normalization_transform],
+            output_transformers=[denorm_transform],
+            precision="single",
+        )
+    else:
+        output_variables = [TorchNDVariable(name="covariance_matrix", shape=(6, 6))]
+        denorm_transform = CovarianceDenormTransform(M_DIAG)
+        torch_model = TorchModel(
+            model=CovOnlyWrapper(model),
+            input_variables=input_variables,
+            output_variables=output_variables,
+            input_transformers=[normalization_transform],
+            output_transformers=[denorm_transform],
+            precision="single",
+        )
 
     Path(dump_dir).mkdir(parents=True, exist_ok=True)
     torch_model.dump(f"{dump_dir}/injector_simulator.yaml")
 
+    if mean_cols:
+        return CovMeanTorchModule(model=torch_model)
     return TorchModule(model=torch_model)
 
 
-def create_lume_torch_machine(model, input_tr, dump_dir="lumetorchyaml-machine"):
-    """Create LUME-torch model that takes machine-PV inputs (wraps sim model)."""
+def create_lume_torch_machine(model, input_tr, mean_cols=None, dump_dir="lumetorchyaml-machine"):
+    """Create LUME-torch model that takes machine-PV inputs (wraps sim model).
+
+    If mean_cols is provided, creates a full model with NDVariable covariance_matrix(6,6)
+    + scalar mean outputs using CovMeanTorchModel. Otherwise creates a cov-only model.
+    """
     feature_cols = list(input_tr["feature_cols"])
     x_mean = input_tr["x_mean"].to(dtype=torch.float32)
     x_std = input_tr["x_std"].to(dtype=torch.float32)
@@ -200,27 +212,43 @@ def create_lume_torch_machine(model, input_tr, dump_dir="lumetorchyaml-machine")
         TorchScalarVariable(name=col, default_value=float(pv_defaults[idx]))
         for idx, col in enumerate(pv_cols)
     ]
-    output_variables = [TorchNDVariable(name="covariance_matrix", shape=(6, 6))]
 
     pv_to_sim_transform = build_pv_to_sim_transform(feature_cols)
     normalization_transform = AffineInputTransform(
         d=len(feature_cols), coefficient=x_std, offset=x_mean
     )
 
-    denorm_transform = CovarianceDenormTransform(M_DIAG)
-
-    torch_model = TorchModel(
-        model=model,
-        input_variables=input_variables,
-        output_variables=output_variables,
-        input_transformers=[pv_to_sim_transform, normalization_transform],
-        output_transformers=[denorm_transform],
-        precision="single",
-    )
+    if mean_cols:
+        output_variables = [
+            TorchNDVariable(name="covariance_matrix", shape=(6, 6)),
+            *[TorchScalarVariable(name=col) for col in mean_cols],
+        ]
+        denorm_transform = FullOutputDenormTransform(M_DIAG)
+        torch_model = CovMeanTorchModel(
+            model=model,
+            input_variables=input_variables,
+            output_variables=output_variables,
+            input_transformers=[pv_to_sim_transform, normalization_transform],
+            output_transformers=[denorm_transform],
+            precision="single",
+        )
+    else:
+        output_variables = [TorchNDVariable(name="covariance_matrix", shape=(6, 6))]
+        denorm_transform = CovarianceDenormTransform(M_DIAG)
+        torch_model = TorchModel(
+            model=CovOnlyWrapper(model),
+            input_variables=input_variables,
+            output_variables=output_variables,
+            input_transformers=[pv_to_sim_transform, normalization_transform],
+            output_transformers=[denorm_transform],
+            precision="single",
+        )
 
     Path(dump_dir).mkdir(parents=True, exist_ok=True)
     torch_model.dump(f"{dump_dir}/injector_machine.yaml")
 
+    if mean_cols:
+        return CovMeanTorchModule(model=torch_model)
     return TorchModule(model=torch_model)
 
 
@@ -271,16 +299,15 @@ def main():
                 pred_cov = output
             pred_batches.append(pred_cov.cpu().numpy())
 
-    # --- Sim-input LUME-torch model validation ---
-    lume_sim_model = create_lume_torch_sim(model, input_tr)
+    # --- Sim-input LUME-torch model validation (cov-only) ---
+    lume_sim_model = create_lume_torch_sim(model, input_tr, mean_cols=None)
     loader_sim = DataLoader(TensorDataset(torch.from_numpy(X_sim)), batch_size=args.batch_size)
 
     pred_batches_lume_sim = []
     with torch.no_grad():
         for (X_batch,) in loader_sim:
             output = lume_sim_model(X_batch.to(device))
-            pred_cov_lume = output.cpu().numpy() if not has_mean else output[0].cpu().numpy() if isinstance(output, tuple) else output.cpu().numpy()
-            pred_batches_lume_sim.append(pred_cov_lume)
+            pred_batches_lume_sim.append(output.cpu().numpy())
 
     # Reference predictions with M denormalization applied
     loader_ref = DataLoader(TensorDataset(torch.from_numpy(X_norm)), batch_size=args.batch_size)
@@ -301,9 +328,9 @@ def main():
         raise AssertionError(
             f"Sim-input LUME model mismatch vs direct model; max abs diff={max_abs_diff:.6e}"
         )
-    print("[run] Sim-input LUME-torch model validated successfully", flush=True)
+    print("[run] Sim-input LUME-torch model (cov-only) validated successfully", flush=True)
 
-    # --- Machine-input LUME-torch model validation ---
+    # --- Machine-input LUME-torch model validation (cov-only) ---
     X_machine = sim_to_machine_array(X_sim, feature_cols)
     # Compute reference through same roundtrip path to avoid float32 precision loss
     X_sim_roundtrip = machine_to_sim_array(X_machine, feature_cols)
@@ -321,15 +348,14 @@ def main():
             pred_batches_machine_ref.append(pred_cov)
     preds_cov_machine_ref = np.concatenate(pred_batches_machine_ref, axis=0)
 
-    lume_machine_model = create_lume_torch_machine(model, input_tr)
+    lume_machine_model = create_lume_torch_machine(model, input_tr, mean_cols=None)
     loader_machine = DataLoader(TensorDataset(torch.from_numpy(X_machine)), batch_size=args.batch_size)
 
     pred_batches_lume_machine = []
     with torch.no_grad():
         for (X_batch,) in loader_machine:
             output = lume_machine_model(X_batch.to(device))
-            pred_cov_lume = output.cpu().numpy() if not has_mean else output[0].cpu().numpy() if isinstance(output, tuple) else output.cpu().numpy()
-            pred_batches_lume_machine.append(pred_cov_lume)
+            pred_batches_lume_machine.append(output.cpu().numpy())
 
     preds_cov_lume_machine = np.concatenate(pred_batches_lume_machine, axis=0)
 
@@ -338,7 +364,76 @@ def main():
         raise AssertionError(
             f"Machine-input LUME model mismatch vs direct model; max abs diff={max_abs_diff:.6e}"
         )
-    print("[run] Machine-input LUME-torch model validated successfully", flush=True)
+    print("[run] Machine-input LUME-torch model (cov-only) validated successfully", flush=True)
+
+    # --- Full model with mean outputs (sim + machine) ---
+    if has_mean:
+        lume_sim_full = create_lume_torch_sim(model, input_tr, mean_cols=mean_cols, dump_dir="lumetorchyaml-sim-full")
+        lume_machine_full = create_lume_torch_machine(model, input_tr, mean_cols=mean_cols, dump_dir="lumetorchyaml-machine-full")
+        print("[run] Full LUME-torch models (cov + mean) dumped to lumetorchyaml-*-full/", flush=True)
+
+        # Build reference: direct model -> M-denorm cov + raw means
+        loader_ref_full = DataLoader(TensorDataset(torch.from_numpy(X_norm)), batch_size=args.batch_size)
+        ref_cov_list, ref_mean_list = [], []
+        with torch.no_grad():
+            for (X_batch,) in loader_ref_full:
+                pred_cov_full, pred_mean_full = model(X_batch.to(device))
+                pred_cov_denorm = np.array([m_inv @ c @ m_inv.T for c in pred_cov_full.cpu().numpy()])
+                ref_cov_list.append(pred_cov_denorm)
+                ref_mean_list.append(pred_mean_full.cpu().numpy())
+        ref_covs_full = np.concatenate(ref_cov_list, axis=0)
+        ref_means_full = np.concatenate(ref_mean_list, axis=0)
+
+        # Validate sim-input full model
+        pred_full_sim_batches = []
+        with torch.no_grad():
+            for (X_batch,) in loader_sim:
+                out = lume_sim_full(X_batch.to(device)).cpu().numpy()
+                pred_full_sim_batches.append(out)
+        preds_full_sim = np.concatenate(pred_full_sim_batches, axis=0)
+        # Full output is flat (N, 42): first 36 = cov, last 6 = means
+        n_mean = len(mean_cols)
+        sim_full_covs = preds_full_sim[:, :36].reshape(-1, 6, 6)
+        sim_full_means = preds_full_sim[:, 36:36 + n_mean]
+
+        if not np.allclose(ref_covs_full, sim_full_covs, rtol=1e-5, atol=1e-5):
+            max_diff = float(np.max(np.abs(ref_covs_full - sim_full_covs)))
+            raise AssertionError(f"Sim full model COV mismatch; max abs diff={max_diff:.6e}")
+        if not np.allclose(ref_means_full, sim_full_means, rtol=1e-5, atol=1e-5):
+            max_diff = float(np.max(np.abs(ref_means_full - sim_full_means)))
+            raise AssertionError(f"Sim full model MEAN mismatch; max abs diff={max_diff:.6e}")
+        print("[run] Sim-input LUME-torch full model (cov + mean) validated successfully", flush=True)
+
+        # Validate machine-input full model (use roundtrip reference)
+        loader_machine_ref_full = DataLoader(
+            TensorDataset(torch.from_numpy(X_norm_roundtrip)), batch_size=args.batch_size
+        )
+        ref_cov_m_list, ref_mean_m_list = [], []
+        with torch.no_grad():
+            for (X_batch,) in loader_machine_ref_full:
+                pred_cov_full, pred_mean_full = model(X_batch.to(device))
+                pred_cov_denorm = np.array([m_inv @ c @ m_inv.T for c in pred_cov_full.cpu().numpy()])
+                ref_cov_m_list.append(pred_cov_denorm)
+                ref_mean_m_list.append(pred_mean_full.cpu().numpy())
+        ref_covs_machine_full = np.concatenate(ref_cov_m_list, axis=0)
+        ref_means_machine_full = np.concatenate(ref_mean_m_list, axis=0)
+
+        pred_full_machine_batches = []
+        with torch.no_grad():
+            for (X_batch,) in loader_machine:
+                out = lume_machine_full(X_batch.to(device)).cpu().numpy()
+                pred_full_machine_batches.append(out)
+        preds_full_machine = np.concatenate(pred_full_machine_batches, axis=0)
+        machine_full_covs = preds_full_machine[:, :36].reshape(-1, 6, 6)
+        machine_full_means = preds_full_machine[:, 36:36 + n_mean]
+
+        if not np.allclose(ref_covs_machine_full, machine_full_covs, rtol=1e-5, atol=1e-5):
+            max_diff = float(np.max(np.abs(ref_covs_machine_full - machine_full_covs)))
+            raise AssertionError(f"Machine full model COV mismatch; max abs diff={max_diff:.6e}")
+        if not np.allclose(ref_means_machine_full, machine_full_means, rtol=1e-5, atol=1e-5):
+            max_diff = float(np.max(np.abs(ref_means_machine_full - machine_full_means)))
+            raise AssertionError(f"Machine full model MEAN mismatch; max abs diff={max_diff:.6e}")
+        print("[run] Machine-input LUME-torch full model (cov + mean) validated successfully", flush=True)
 
     preds_cov = np.concatenate(pred_batches, axis=0)
 

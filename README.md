@@ -1,19 +1,16 @@
 # 571 Covariance Surrogate Model
 
-ML surrogate model predicting the 6×6 beam covariance matrix (+ mean energy/time) from 19 accelerator input parameters at the FACET-II 571 location.
+ML surrogate model predicting the full 6×6 beam covariance matrix and all 6 phase-space mean values (x, px, y, py, t, pz) from 19 accelerator input parameters at the FACET-II 571 location.
 
 ## Pipeline
 
 ### 1. Data Preparation
 
 ```bash
-# Extract covariance targets (Cholesky factors) from particle h5 files
+# Extract all targets (Cholesky factors + 6 phase-space means) from particle h5 files in a single pass
 # --normalize applies M-normalization before Cholesky decomposition
-python create_cov_targets_from_particles.py particles-571.csv cov-targets.csv \
+python create_targets_from_particles.py particles-571.csv targets-571.csv \
     --particles-column bmad_final_particles --normalize --drop-failed --progress-every 100
-
-# Extract mean beam values (energy, time)
-python extract_beam_means.py
 
 # Combine into single dataset with sim inputs + targets
 python create_dataset.py
@@ -40,7 +37,7 @@ python train.py --cov-loss l1 --epochs 200 --patience 40 --batch-size 256 --lr 1
     --output-dir model-output-571-more-data
 ```
 
-- **Architecture:** MLP backbone (100→200→200→300→300→200→100→100→100, ELU, Dropout 0.05), dual heads for Cholesky (21 outputs) and mean beam (2 outputs)
+- **Architecture:** MLP backbone (100→200→200→300→300→200→100→100→100, ELU, Dropout 0.05), dual heads for Cholesky (21 outputs) and mean beam (6 outputs: mean_x, mean_px, mean_y, mean_py, mean_t, mean_pz)
 - **Loss:** L1 in normalized covariance space (CovarianceAwareLoss)
 - **Training:** 200 epochs base + 3 finetuning stages (batch 32→8→2, 300 epochs each) with LR annealing
 - **Parameters:** 316k
@@ -105,8 +102,12 @@ python learning_curve.py --cov-loss l1 --output-dir learning-curve-571
 | cov_22 (σ²_y) | 0.79 |
 | cov_33 (σ²_py) | 0.72 |
 | cov_55 (σ²_pz) | 0.91 |
-| mean_energy | 0.998 |
-| mean_time | 0.88 |
+| mean_x | — |
+| mean_px | — |
+| mean_y | — |
+| mean_py | — |
+| mean_t | — |
+| mean_pz | — |
 | **Overall mean R²** | **0.51** |
 
 ## Conclusions
@@ -127,8 +128,12 @@ python learning_curve.py --cov-loss l1 --output-dir learning-curve-571
 | `compare_2d_distributions_571.py` | 2D ellipse comparison vs particle ground truth |
 | `learning_curve.py` | Train at data fractions, plot samples vs accuracy |
 | `overfit_test.py` | Capacity test (train with no regularization) |
-| `create_cov_targets_from_particles.py` | Extract Cholesky targets from h5 particles |
+| `create_targets_from_particles.py` | Extract Cholesky targets + all 6 phase-space means from h5 particles (single pass) |
+| `create_cov_targets_from_particles.py` | Extract Cholesky targets only from h5 particles (legacy) |
+| `extract_beam_means.py` | Extract mean energy/time only (legacy, replaced by `create_targets_from_particles.py`) |
 | `create_dataset.py` | Combine inputs + targets into dataset CSV |
 | `split_dataset.py` | Train/val/test split |
 | `pv_mapping.py` | Sim parameter ↔ machine PV name mapping |
+| `lume_model_utils.py` | Custom lume-torch model/transforms for full covariance + mean output |
+| `plot_beam_overlap.py` | Overlapping beam distribution plots (particles vs predicted covariance) |
 | `infer_covariance.py` | Run inference on new inputs |
