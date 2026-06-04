@@ -93,6 +93,15 @@ def build_parser():
         action="store_true",
         help="Use the full model (covariance + all 6 phase-space means) for sampling with correct beam center",
     )
+    parser.add_argument(
+        "--min-alive-particles",
+        type=int,
+        default=None,
+        help=(
+            "Skip samples with fewer than this many alive particles. "
+            "Use the same threshold as create_targets_from_particles.py for apples-to-apples comparison."
+        ),
+    )
     return parser
 
 
@@ -106,9 +115,24 @@ def parse_projection(proj_str):
     return idx_a, idx_b
 
 
-def load_true_particles(h5_path: str):
-    """Load particle beam from h5 and return 7D phase-space array (N, 7): x, px, y, py, t, pz, z."""
+def load_true_particles(h5_path: str, min_alive: int = None):
+    """Load particle beam from h5 and return 7D phase-space array (N, 7): x, px, y, py, t, pz, z.
+
+    Filters to alive particles (status == 1) per the openPMD-beamphysics
+    convention, matching the filter used in create_targets_from_particles.py
+    so the true beam is consistent with the model's training targets.
+
+    If min_alive is set, raises ValueError when too few particles survive.
+    """
     beam = ParticleGroup(h5=h5_path)
+    alive_mask = beam["status"] == 1
+    n_alive = int(np.count_nonzero(alive_mask))
+    if n_alive == 0:
+        raise ValueError(f"no alive particles (status==1) in {h5_path}")
+    if min_alive is not None and n_alive < min_alive:
+        raise ValueError(f"{n_alive} alive < {min_alive} threshold")
+    if n_alive < len(alive_mask):
+        beam = beam[alive_mask]
     # Extract: x, px, y, py, t, pz, z
     particles = np.column_stack([
         beam.x, beam.px, beam.y, beam.py, beam.t, beam.pz, beam.z
@@ -141,6 +165,7 @@ def plot_overlap(
     projections: list,
     sample_label: str,
     output_path: Path,
+    pred_cov_6x6: np.ndarray = None,
 ):
     """Plot overlapping 2D density contours of true vs predicted particles for given projections."""
     from scipy.stats import gaussian_kde
@@ -202,6 +227,25 @@ def plot_overlap(
             Line2D([0], [0], color="tab:orange", linewidth=1.5, linestyle="dashed", label="Predicted (Covariance)"),
         ]
         ax.legend(handles=legend_elements, fontsize=8)
+
+        # Display true and predicted 2x2 covariance sub-matrices
+        true_cov_2x2 = np.cov(true_particles[:, idx_a], true_particles[:, idx_b])
+        la, lb = PHASE_SPACE_LABELS[idx_a], PHASE_SPACE_LABELS[idx_b]
+        cov_text = (
+            f"True cov ({la},{lb}):\n"
+            f"  [{true_cov_2x2[0,0]:+.4e}  {true_cov_2x2[0,1]:+.4e}]\n"
+            f"  [{true_cov_2x2[1,0]:+.4e}  {true_cov_2x2[1,1]:+.4e}]"
+        )
+        if pred_cov_6x6 is not None:
+            pred_sub = pred_cov_6x6[np.ix_([idx_a, idx_b], [idx_a, idx_b])]
+            cov_text += (
+                f"\nPred cov ({la},{lb}):\n"
+                f"  [{pred_sub[0,0]:+.4e}  {pred_sub[0,1]:+.4e}]\n"
+                f"  [{pred_sub[1,0]:+.4e}  {pred_sub[1,1]:+.4e}]"
+            )
+        ax.text(0.02, 0.98, cov_text, transform=ax.transAxes,
+                fontsize=6.5, verticalalignment="top", fontfamily="monospace",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
     fig.suptitle(sample_label, fontsize=11)
     plt.tight_layout()
@@ -276,7 +320,7 @@ def main():
 
         # Load true particles (no drift for screen 571)
         try:
-            true_particles = load_true_particles(h5_path)
+            true_particles = load_true_particles(h5_path, min_alive=args.min_alive_particles)
         except Exception as e:
             print(f"[skip] Row {idx}: failed to load particles: {e}", flush=True)
             continue
@@ -308,7 +352,8 @@ def main():
         # Plot
         sample_label = f"Sample {idx} — True particles vs Predicted covariance"
         output_path = output_dir / f"overlap_sample_{idx:05d}.png"
-        plot_overlap(true_particles, pred_particles, projections, sample_label, output_path)
+        plot_overlap(true_particles, pred_particles, projections, sample_label, output_path,
+                     pred_cov_6x6=pred_cov_phys)
         print(f"[run] Saved: {output_path}", flush=True)
 
     print(f"[run] Done. Plots saved to {output_dir}/", flush=True)

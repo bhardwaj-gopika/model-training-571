@@ -4,19 +4,103 @@ ML surrogate model predicting the full 6×6 beam covariance matrix and all 6 pha
 
 ## Pipeline
 
-### 1. Data Preparation
+### 1. Target Extraction
+
+Extract Cholesky-flattened covariance targets and 6 phase-space means from particle `.h5` files. The `--min-alive-particles` flag filters out samples where too many particles were lost in simulation (outliers that distort training).
 
 ```bash
-# Extract all targets (Cholesky factors + 6 phase-space means) from particle h5 files in a single pass
-# --normalize applies M-normalization before Cholesky decomposition
 python create_targets_from_particles.py particles-571.csv targets-571.csv \
-    --particles-column bmad_final_particles --normalize --drop-failed --progress-every 100
+    --particles-column bmad_final_particles \
+    --normalize --drop-failed --progress-every 1000 \
+    --min-alive-particles 90000
+```
 
-# Combine into single dataset with sim inputs + targets
-python create_dataset.py
+- `--normalize`: applies M-normalization before Cholesky decomposition
+- `--min-alive-particles 90000`: skips samples with <90k alive particles (out of 100k total), removing ~14% outlier samples where massive particle loss produces extreme covariance values
 
-# Split into train/val/test (70/15/15)
-python split_dataset.py
+### 2. Dataset Assembly
+
+Combines 19 simulator input columns with targets into a single CSV. Drops rows with null values.
+
+```bash
+python create_dataset.py --inputs particles-571.csv --targets targets-571.csv --output dataset.csv
+```
+
+Output columns: 19 inputs + 6 means + 21 Cholesky elements = 46 columns.
+
+### 3. Train/Val/Test Split
+
+```bash
+python split_dataset.py --input dataset.csv --seed 42
+```
+
+Output: `dataset-train.csv`, `dataset-val.csv`, `dataset-test.csv` (70/15/15 split).
+
+### 4. Training
+
+```bash
+python train.py --cov-loss l1 --epochs 200 --patience 40 --batch-size 256 --lr 1e-3 \
+    --finetune-batch-sizes 32 8 2 --finetune-epochs-per-stage 300 \
+    --finetune-lr 1e-4 --finetune-lr-decay 0.5 \
+    --finetune-plateau-patience 5 --finetune-min-lr 1e-6 \
+    --output-dir model-output-571-alive
+```
+
+On SLURM (GPU):
+```bash
+sbatch gpu.sh
+```
+
+- **Architecture:** MLP backbone (100→200→200→300→300→200→100→100→100, ELU, Dropout 0.05), dual heads for Cholesky (21 outputs) and mean beam (6 outputs: mean_x, mean_px, mean_y, mean_py, mean_t, mean_pz)
+- **Loss:** L1 in normalized covariance space (CovarianceAwareLoss)
+- **Training:** 200 epochs base + 3 finetuning stages (batch 32→8→2, 300 epochs each) with LR annealing
+- **Parameters:** 316k
+
+### 5. Analysis
+
+```bash
+# Standard metrics (R², MAE, MAPE per element, scatter plots)
+python analyze_covariance.py --model-dir model-output-571-alive --output-dir analysis-alive
+
+# Filtered metrics (beam quality thresholds)
+python analyze_filtered.py --model-dir model-output-571-alive --output-dir analysis-filtered-alive
+```
+
+### 6. Inference & LUME Export
+
+Runs inference on test set, validates LUME-Torch models (sim + machine input spaces), and exports deployable YAML model files.
+
+```bash
+python infer_covariance.py --model-dir model-output-571-alive --input-csv dataset-test.csv
+```
+
+This generates:
+- `inference-output/predicted_covariances.csv` — flat predictions
+- `lumetorchyaml-sim/`, `lumetorchyaml-machine/` — cov-only LUME models
+- `lumetorchyaml-sim-full/`, `lumetorchyaml-machine-full/` — cov + mean LUME models
+
+### 7. Package Model & Overlap Plots
+
+Copy LUME model files into the deployable package and regenerate overlap plots:
+
+```bash
+# Copy model files into package
+cp -r lumetorchyaml-sim/ ../facet2-model-571/facet2_inj_ml_model_571/resources/lumetorchyaml-sim/
+cp -r lumetorchyaml-sim-full/ ../facet2-model-571/facet2_inj_ml_model_571/resources/lumetorchyaml-sim-full/
+cp -r lumetorchyaml-machine/ ../facet2-model-571/facet2_inj_ml_model_571/resources/lumetorchyaml-machine/
+cp -r lumetorchyaml-machine-full/ ../facet2-model-571/facet2_inj_ml_model_571/resources/lumetorchyaml-machine-full/
+
+# Reinstall package
+cd ../facet2-model-571 && pip install -e . && cd -
+
+# Generate overlap plots (KDE contours with true/predicted 2x2 covariance annotations)
+python plot_beam_overlap.py \
+    --particles-csv particles-571.csv \
+    --input-space sim \
+    --num-samples 5 \
+    --full \
+    --min-alive-particles 90000 \
+    --output-dir overlap-plots-alive
 ```
 
 **M-Normalization:** The raw 6×6 covariance matrix has elements spanning wildly different scales (e.g., position in meters vs momentum in eV/c). Before taking the Cholesky decomposition, we apply $C_{\text{norm}} = M \cdot C \cdot M^T$ with:
@@ -25,41 +109,7 @@ $$M = \text{diag}(10^3,\ 10^{-6},\ 10^3,\ 10^{-6},\ 10^{12},\ 10^{-6})$$
 
 This brings all phase-space dimensions (x, px, y, py, t, pz) to comparable numerical scales, which makes the Cholesky elements better-conditioned for ML training. The inverse transform $C_{\text{phys}} = M^{-1} C_{\text{norm}} M^{-1T}$ recovers physical units at inference time.
 
-**Output:** `dataset-train.csv`, `dataset-val.csv`, `dataset-test.csv`
-
-### 2. Training
-
-```bash
-python train.py --cov-loss l1 --epochs 200 --patience 40 --batch-size 256 --lr 1e-3 \
-    --finetune-batch-sizes 32 8 2 --finetune-epochs-per-stage 300 \
-    --finetune-lr 1e-4 --finetune-lr-decay 0.5 \
-    --finetune-plateau-patience 5 --finetune-min-lr 1e-6 \
-    --output-dir model-output-571-more-data
-```
-
-- **Architecture:** MLP backbone (100→200→200→300→300→200→100→100→100, ELU, Dropout 0.05), dual heads for Cholesky (21 outputs) and mean beam (6 outputs: mean_x, mean_px, mean_y, mean_py, mean_t, mean_pz)
-- **Loss:** L1 in normalized covariance space (CovarianceAwareLoss)
-- **Training:** 200 epochs base + 3 finetuning stages (batch 32→8→2, 300 epochs each) with LR annealing
-- **Parameters:** 316k
-
-### 3. Analysis
-
-```bash
-# Standard metrics (R², MAE, MAPE per element, scatter plots)
-python analyze_covariance.py --model-dir model-output-571-more-data --output-dir analysis-more-data
-
-# Filtered metrics (beam quality thresholds)
-python analyze_filtered.py --model-dir model-output-571-more-data --output-dir analysis-more-data-filtered
-
-# 2D phase-space ellipse comparisons against particle ground truth
-python compare_2d_distributions_571.py --output-dir compare-2d-571
-```
-
-### 4. Inference
-
-```bash
-python infer_covariance.py --model-dir model-output-571-more-data --input-csv new_inputs.csv
-```
+**Alive Particle Filtering:** Simulations start with 100,000 particles. Some configurations cause massive particle loss (>10% dead), producing extreme covariance outliers that distort Z-score standardization and degrade training. The `--min-alive-particles 90000` threshold removes these (~9,400 samples, ~14%), improving covariance MAPE by 20–38% on x-px elements.
 
 ## Diagnostic Experiments
 
@@ -121,19 +171,17 @@ python learning_curve.py --cov-loss l1 --output-dir learning-curve-571
 
 | File | Purpose |
 |---|---|
-| `train.py` | Main training script (dual-head covariance + mean beam) |
-| `train_emittance_weighted.py` | Training with emittance-weighted loss |
-| `analyze_covariance.py` | Post-training analysis (R², MAE, MAPE, scatter plots) |
-| `analyze_filtered.py` | Analysis filtered by beam quality thresholds |
-| `compare_2d_distributions_571.py` | 2D ellipse comparison vs particle ground truth |
-| `learning_curve.py` | Train at data fractions, plot samples vs accuracy |
-| `overfit_test.py` | Capacity test (train with no regularization) |
-| `create_targets_from_particles.py` | Extract Cholesky targets + all 6 phase-space means from h5 particles (single pass) |
-| `create_cov_targets_from_particles.py` | Extract Cholesky targets only from h5 particles (legacy) |
-| `extract_beam_means.py` | Extract mean energy/time only (legacy, replaced by `create_targets_from_particles.py`) |
-| `create_dataset.py` | Combine inputs + targets into dataset CSV |
-| `split_dataset.py` | Train/val/test split |
+| `create_targets_from_particles.py` | Step 1: Extract Cholesky targets + 6 phase-space means from `.h5` particles, with `--min-alive-particles` filtering |
+| `create_dataset.py` | Step 2: Combine inputs + targets into dataset CSV |
+| `split_dataset.py` | Step 3: Train/val/test split |
+| `train.py` | Step 4: Model training (dual-head covariance + mean beam) |
+| `analyze_covariance.py` | Step 5: Post-training analysis (R², MAE, MAPE, scatter plots) |
+| `analyze_filtered.py` | Step 5b: Analysis filtered by beam quality thresholds |
+| `infer_covariance.py` | Step 6: Inference + LUME-Torch model export & validation |
+| `plot_beam_overlap.py` | Step 7: KDE contour overlap plots (true particles vs predicted covariance), with `--min-alive-particles` filtering and 2×2 covariance annotations |
 | `pv_mapping.py` | Sim parameter ↔ machine PV name mapping |
-| `lume_model_utils.py` | Custom lume-torch model/transforms for full covariance + mean output |
-| `plot_beam_overlap.py` | Overlapping beam distribution plots (particles vs predicted covariance) |
-| `infer_covariance.py` | Run inference on new inputs |
+| `lume_model_utils.py` | Custom lume-torch transforms (M-denorm, CovMeanTorchModel) |
+| `compare_data_distributions.py` | Compare old vs new dataset distributions |
+| `make_summary.py` | Summary comparison figure |
+| `gpu.sh` | SLURM job script for training (80GB RAM, 1 GPU, 10h) |
+| `gpu2.sh` | SLURM job script for target extraction |

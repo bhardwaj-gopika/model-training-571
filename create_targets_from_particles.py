@@ -107,6 +107,16 @@ def build_parser():
             "Brings all phase-space dimensions to comparable scales."
         ),
     )
+    parser.add_argument(
+        "--min-alive-particles",
+        type=int,
+        default=None,
+        help=(
+            "Minimum number of alive particles required. Samples with fewer "
+            "alive particles are skipped (marked as 'too_few_alive'). "
+            "Removes outlier samples where most particles were lost."
+        ),
+    )
     return parser
 
 
@@ -145,6 +155,25 @@ def main():
                 status = "missing_path"
             else:
                 group = ParticleGroup(str(file_path))
+
+                # Keep only "alive" particles (status == 1) per openPMD-beamphysics
+                # convention. Dead/lost particles would skew covariance and means.
+                alive_mask = group["status"] == 1
+                n_alive = int(np.count_nonzero(alive_mask))
+                if n_alive == 0:
+                    raise ValueError("no alive particles (status==1) in file")
+                if args.min_alive_particles is not None and n_alive < args.min_alive_particles:
+                    status = "too_few_alive"
+                    error_type = "too_few_alive"
+                    error_message = f"{n_alive} alive < {args.min_alive_particles}"
+                    vectors.append(vec)
+                    mean_values_list.append(mean_vals)
+                    statuses.append(status)
+                    error_types.append(error_type)
+                    error_messages.append(error_message)
+                    continue
+                if n_alive < len(alive_mask):
+                    group = group[alive_mask]
 
                 if args.drift_to_z is not None:
                     group.drift_to_z(z=args.drift_to_z)
@@ -256,3 +285,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
