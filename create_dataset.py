@@ -6,21 +6,21 @@ import pandas as pd
 
 # Input columns for 571 model
 INPUT_COLUMNS = [
-    "CQ10121:b1_gradient", #QUAD:IN10:121:BCTRL
+    "CQ10121:b1_gradient", #QUAD:IN10:121:BACT
     "GUNF:rf_field_scale", #KLYS:LI10:21:AMPL
     "GUNF:theta0_deg", #KLYS:LI10:21:PHAS
     "L0AF_phase:theta0_deg", #KLYS:LI10:31:PHAS
     "L0AF_scale:rf_field_scale",#null
     "L0BF_phase:theta0_deg",#KLYS:LI10:41:PHAS
     "L0BF_scale:rf_field_scale",#null
-    "QA10361",#QUAD:IN10:361:BCTRL
-    "QA10371",#QUAD:IN10:371:BCTRL
-    "QE10425",#QUAD:IN10:425:BCTRL
-    "QE10441",#QUAD:IN10:441:BCTRL
-    "QE10511",#QUAD:IN10:511:BCTRL
-    "QE10525",#QUAD:IN10:525:BCTRL
-    "SOL10111:solenoid_field_scale",#SOLN:IN10:121:BCTRL
-    "SQ10122:b1_gradient",#QUAD:IN10:122:BCTRL
+    "QA10361",#QUAD:IN10:361:BACT
+    "QA10371",#QUAD:IN10:371:BACT
+    "QE10425",#QUAD:IN10:425:BACT
+    "QE10441",#QUAD:IN10:441:BACT
+    "QE10511",#QUAD:IN10:511:BACT
+    "QE10525",#QUAD:IN10:525:BACT
+    "SOL10111:solenoid_field_scale",#SOLN:IN10:121:BACT
+    "SQ10122:b1_gradient",#QUAD:IN10:122:BACT
     "distgen:VCC",
     "distgen:t_dist:sigma_t:value",#null
     "distgen:total_charge:value",#TORO:IN10:591:TMIT_PC
@@ -93,4 +93,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 

@@ -1,4 +1,4 @@
-# AGENTS.md — FACET-II Injector ML Surrogate (571 Screen, More-Data Run)
+# AGENTS.md — FACET-II Injector ML Surrogate (571 Screen)
 
 ## What This Codebase Does
 
@@ -14,7 +14,8 @@ The covariance matrix encodes beam size, divergence, emittance, and correlations
 - **Covariance prediction**: Instead of predicting the full 6×6 symmetric matrix (21 unique elements) directly, the model predicts the **lower-triangular Cholesky factor L** such that Σ = L Lᵀ. This guarantees positive semi-definiteness.
 - **M-normalization**: A diagonal scaling matrix M = diag(1e3, 1e-6, 1e3, 1e-6, 1e12, 1e-6) is applied before Cholesky decomposition to bring all covariance elements to comparable magnitude. Denormalization: Σ_phys = M⁻¹ Σ_norm M⁻¹ᵀ.
 - **Alive particle filtering**: Simulations start with 100,000 particles. Samples with <90,000 alive particles are filtered out during target extraction (`--min-alive-particles 90000`). These low-survival samples produce extreme covariance outliers that distort Z-score standardization and degrade training. This removes ~14% of samples (~9,400) and improves covariance MAPE by 20–38%.
-- **This run ("more-data")**: Uses ~53k training samples (after alive filtering) vs the baseline 15k, testing whether the model is data-limited. Result: confirmed data limitation with significant improvement.
+- **Beam-quality filtering**: After alive-particle filtering, samples outside physically reasonable beam thresholds are removed (σ_x,σ_y < 5 mm, relative energy spread < 5×10⁻³, normalized emittance ε_x,ε_y < 20 μm). This focuses the model on the operating regime of interest.
+- **No dropout**: The final model is trained with dropout disabled (`--dropout 0.0`). With ~53k training samples and beam-quality filtering removing outliers, regularization via dropout is unnecessary.
 
 ## Pipeline Steps
 
@@ -45,33 +46,47 @@ python create_dataset.py \
 
 Output columns: 19 inputs + 6 means + 21 Cholesky elements = 46 columns.
 
-### 3. Train/Val/Test Split (`split_dataset.py`)
+### 3. Beam-Quality Filtering (`filter_dataset.py`)
 
-Splits `dataset.csv` into 70/15/15 train/val/test splits.
+Filters the dataset to keep only samples within physically reasonable beam thresholds.
 
 ```bash
-python split_dataset.py --input dataset.csv --seed 42
+python filter_dataset.py --input dataset.csv --output dataset-filtered.csv
 ```
 
-Outputs: `dataset-train.csv`, `dataset-val.csv`, `dataset-test.csv`.
+Default thresholds: σ_x < 5 mm, σ_y < 5 mm, relative energy spread < 5×10⁻³, ε_x < 20 μm, ε_y < 20 μm.
 
-### 4. Training (`train.py`)
+### 4. Train/Val/Test Split (`split_dataset.py`)
+
+Splits `dataset-filtered.csv` into 70/15/15 train/val/test splits.
+
+```bash
+python split_dataset.py --input dataset-filtered.csv --seed 42
+```
+
+Outputs: `dataset-filtered-train.csv`, `dataset-filtered-val.csv`, `dataset-filtered-test.csv`.
+
+### 5. Training (`train2.py`)
 
 Trains a `CovarianceSurrogateModel` MLP with dual output heads:
 - **Cholesky head**: 21 outputs → reconstructed 6×6 covariance via L @ Lᵀ
 - **Mean head**: 6 outputs → phase-space means
 
-Architecture: 100 → 200 → 200 → 300 → 300 → 200 → 100 → 100 → 100 (ELU activation, Dropout 0.05, ~316k parameters).
+Architecture: 100 → 200 → 200 → 300 → 300 → 200 → 100 → 100 → 100 (ELU activation, **no dropout**, ~316k parameters).
 
 Training strategy: 200 base epochs + 3 finetuning stages (batch 32→8→2, 300 epochs each, LR cosine annealing).
 
+Key improvements over `train.py`: configurable dropout (set to 0), configurable activation function, gradient clipping support, saves `model_config.json`.
+
 ```bash
-python train.py \
+python train2.py \
   --cov-loss l1 --epochs 200 --patience 40 --batch-size 256 --lr 1e-3 \
+  --dropout 0.0 \
   --finetune-batch-sizes 32 8 2 --finetune-epochs-per-stage 300 \
   --finetune-lr 1e-4 --finetune-lr-decay 0.5 \
   --finetune-plateau-patience 5 --finetune-min-lr 1e-6 \
-  --output-dir model-output-571-alive
+  --train-csv dataset-filtered-train.csv --val-csv dataset-filtered-val.csv \
+  --output-dir model-output-571-filtered2
 ```
 
 On SLURM (GPU):
@@ -79,43 +94,40 @@ On SLURM (GPU):
 sbatch gpu.sh
 ```
 
-Saves to `model-output-571-alive/`: `model.pt`, `input_transformers.pt`, `output_transformers.pt`, `covariance_transformers.pt`, `mean_transformers.pt`, `training_history.csv`.
+Saves to `model-output-571-filtered2/`: `model.pt`, `input_transformers.pt`, `output_transformers.pt`, `covariance_transformers.pt`, `mean_transformers.pt`, `training_history.csv`, `model_config.json`.
 
-### 5. Analysis (`analyze_covariance.py`)
+### 6. Analysis (`analyze_covariance2.py`)
 
 Evaluates trained model on test set. Computes R², MAE, MAPE, RMSE per covariance element and mean target.
 
 ```bash
-python analyze_covariance.py \
-  --model-dir model-output-571-alive \
-  --test dataset-test.csv \
-  --output-dir analysis-alive
+python analyze_covariance2.py \
+  --model-dir model-output-571-filtered2 \
+  --test dataset-filtered-test.csv \
+  --output-dir analysis-filtered2
 ```
 
 Outputs: `test_metrics.csv`, `mean_beam_metrics.csv`, scatter/bar plots (PNG).
 
-### 6. Filtered Analysis (`analyze_filtered.py`)
+### 7. Filtered Analysis (`analyze_filtered2.py`)
 
-Re-evaluates on test samples passing beam-quality cuts:
-- σ_x, σ_y < 5 mm
-- Relative energy spread < 5×10⁻³
-- Normalized projected emittance < 20 μm
+Re-evaluates on test samples passing beam-quality cuts.
 
 ```bash
-python analyze_filtered.py \
-  --model-dir model-output-571-alive \
-  --test dataset-test.csv \
-  --output-dir analysis-filtered-alive
+python analyze_filtered2.py \
+  --model-dir model-output-571-filtered2 \
+  --test dataset-filtered-test.csv \
+  --output-dir analysis-filtered2-filtered
 ```
 
-### 7. Inference & LUME Export (`infer_covariance.py`)
+### 8. Inference & LUME Export (`infer_covariance2.py`)
 
 Runs inference and exports LUME-Torch YAML model files for deployment. Validates both simulator-parameter and machine-PV input spaces. Creates cov-only and full (cov + mean) model variants.
 
 ```bash
-python infer_covariance.py \
-  --model-dir model-output-571-alive \
-  --input-csv dataset-test.csv
+python infer_covariance2.py \
+  --model-dir model-output-571-filtered2 \
+  --input-csv dataset-filtered-test.csv
 ```
 
 Outputs:
@@ -125,7 +137,7 @@ Outputs:
 
 Machine-PV mapping is defined in `pv_mapping.py` (affine transform: 19 parameters with per-channel scale and offset).
 
-### 8. Package Model Update
+### 9. Package Model Update
 
 Copy LUME model files into the deployable `facet2-model-571` package:
 
@@ -137,7 +149,7 @@ cp -r lumetorchyaml-machine-full/ ../facet2-model-571/facet2_inj_ml_model_571/re
 cd ../facet2-model-571 && pip install -e . && cd -
 ```
 
-### 9. Overlap Plots (`plot_beam_overlap.py`)
+### 10. Overlap Plots (`plot_beam_overlap.py`)
 
 Generates KDE contour overlap plots comparing true particle distributions against samples from predicted covariance. Displays true and predicted 2×2 covariance sub-matrices on each panel. Uses `--min-alive-particles` to match the training filter.
 
@@ -148,7 +160,15 @@ python plot_beam_overlap.py \
   --num-samples 5 \
   --full \
   --min-alive-particles 90000 \
-  --output-dir overlap-plots-alive
+  --output-dir overlap-plots
+```
+
+### 11. End-to-End Demo (`end_to_end_demo.py`)
+
+Demonstrates the full inference pipeline: loading the packaged model via `facet2_inj_ml_model_571`, calling `evaluate()`, wrapping in `BeamOutputModel` to produce a sampled particle distribution, and overlaying with true OpenPMD particles.
+
+```bash
+python end_to_end_demo.py --particles-csv particles-571.csv --num-samples 3
 ```
 
 ## Key Outputs & Transformations
@@ -156,6 +176,7 @@ python plot_beam_overlap.py \
 | Artifact | Description |
 |----------|-------------|
 | `model.pt` | Trained PyTorch model weights (CovarianceSurrogateModel) |
+| `model_config.json` | Model architecture config (dropout, activation) |
 | `input_transformers.pt` | Input standardization (x_mean, x_std, feature_cols) |
 | `output_transformers.pt` | Combined output standardization (y_mean, y_std) |
 | `covariance_transformers.pt` | Cholesky target standardization (cov_mean, cov_std, cov_labels) |
@@ -175,53 +196,46 @@ python plot_beam_overlap.py \
 ## Directory Structure
 
 ```
-modeling-571-moredata/
+modeling-571-t/
 ├── particles-571.csv           # Particle file paths + sim input columns (~65k rows)
-├── targets-571.csv             # Extracted Cholesky + mean targets (~53k rows after alive filter)
 ├── dataset.csv                 # Combined inputs + targets (46 columns)
-├── dataset-train.csv           # Training split (70%)
-├── dataset-val.csv             # Validation split (15%)
-├── dataset-test.csv            # Test split (15%)
+├── dataset-filtered.csv        # Beam-quality-filtered dataset
+├── dataset-filtered-train.csv  # Filtered training split (70%)
+├── dataset-filtered-val.csv    # Filtered validation split (15%)
+├── dataset-filtered-test.csv   # Filtered test split (15%)
 │
 ├── create_targets_from_particles.py   # Step 1: extract targets from .h5 files (--min-alive-particles)
 ├── create_dataset.py                  # Step 2: merge inputs + targets
-├── split_dataset.py                   # Step 3: train/val/test split
-├── train.py                           # Step 4: model training
-├── analyze_covariance.py              # Step 5: test-set evaluation
-├── analyze_filtered.py                # Step 6: filtered evaluation
-├── infer_covariance.py                # Step 7: inference & LUME export
-├── plot_beam_overlap.py               # Step 9: KDE overlap plots (--min-alive-particles)
+├── filter_dataset.py                  # Step 3: beam-quality filtering
+├── split_dataset.py                   # Step 4: train/val/test split
+├── train2.py                          # Step 5: model training (no dropout, configurable)
+├── analyze_covariance2.py             # Step 6: test-set evaluation
+├── analyze_filtered2.py               # Step 7: filtered evaluation
+├── infer_covariance2.py               # Step 8: inference & LUME export
+├── plot_beam_overlap.py               # Step 10: KDE overlap plots
+├── end_to_end_demo.py                 # Step 11: full pipeline demo
+├── BeamOutputModel.py                 # Wraps cov+mean predictions into particle distribution
 │
 ├── pv_mapping.py               # Machine PV ↔ sim parameter affine mapping
 ├── lume_model_utils.py          # Custom lume-torch transforms (M-denorm, CovMeanTorchModel)
-├── compare_data_distributions.py      # Old vs new data comparison
-├── make_summary.py                    # Summary comparison figure
 │
 ├── gpu.sh                      # SLURM job script for training (80GB RAM, 1 GPU, 10h)
 ├── gpu2.sh                     # SLURM job script for target extraction
 │
-├── model-output-571-alive/     # Trained model checkpoint & transformers (alive-filtered)
+├── model-output-571-filtered2/ # Trained model checkpoint & transformers (filtered, no dropout)
 │   ├── model.pt
+│   ├── model_config.json
 │   ├── input_transformers.pt
 │   ├── output_transformers.pt
 │   ├── covariance_transformers.pt
 │   ├── mean_transformers.pt
 │   └── training_history.csv
 │
-├── analysis-alive/             # Full test-set analysis (alive-filtered model)
-│   ├── test_metrics.csv
-│   ├── mean_beam_metrics.csv
-│   └── *.png
-│
-├── analysis-filtered-alive/    # Beam-quality-filtered analysis
-├── analysis-data-comparison/   # Old vs new dataset distribution plots
-│
 ├── lumetorchyaml-sim/          # LUME-Torch model (sim-parameter inputs, cov-only)
 ├── lumetorchyaml-sim-full/     # LUME-Torch model (sim inputs, cov + means)
 ├── lumetorchyaml-machine/      # LUME-Torch model (machine PV inputs, cov-only)
 ├── lumetorchyaml-machine-full/ # LUME-Torch model (machine PVs, cov + means)
 │
-├── overlap-plots-alive/        # KDE overlap plots (alive-filtered)
 └── inference-output/           # Inference result CSVs
 ```
 
@@ -235,6 +249,7 @@ Inferred from imports (no `requirements.txt` in this directory):
 - `lume-torch` (SLAC beamphysics org)
 - `openPMD-beamphysics` (`ParticleGroup` class)
 - `botorch` (`AffineInputTransform`)
+- `facet2-inj-ml-model-571` (deployable model package)
 
 The deployable model package is in `facet2-model-571/` with its own `pyproject.toml` (requires `lume-torch`, `numpy`, `pandas`, `torch`, Python ≥ 3.11).
 
@@ -244,10 +259,10 @@ There are no unit tests in this directory. Validation is done via the analysis s
 
 ```bash
 # Full test-set evaluation
-python analyze_covariance.py --model-dir model-output-571-alive --test dataset-test.csv --output-dir analysis-alive
+python analyze_covariance2.py --model-dir model-output-571-filtered2 --test dataset-filtered-test.csv --output-dir analysis-filtered2
 
 # Filtered evaluation (beam-quality cuts)
-python analyze_filtered.py --model-dir model-output-571-alive --test dataset-test.csv --output-dir analysis-filtered-alive
+python analyze_filtered2.py --model-dir model-output-571-filtered2 --test dataset-filtered-test.csv --output-dir analysis-filtered2-filtered
 ```
 
 The packaged model (`facet2-model-571/`) has tests:
