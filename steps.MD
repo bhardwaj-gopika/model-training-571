@@ -1,13 +1,27 @@
-NEW_DIR=/sdf/data/ad/ard-online/FACET-II_Training_Data/2026-09-18
-ONE_FILE=$(ls $NEW_DIR/*_571.h5 | head -1)
-python inspect_standard_h5.py "$ONE_FILE" --max-batches 1 | grep -A2 -i "bin_size\|VCC"
-python build_dataset_from_standard.py "$ONE_FILE" --output /tmp/probe.csv --normalize --min-alive-frac 0.9 --probe
 
-NEW_DIR=/sdf/data/ad/ard-online/FACET-II_Training_Data/2026-09-18
-ls $NEW_DIR/*_571.h5 > file_list_571.txt
-wc -l file_list_571.txt
-N_FILES=$(wc -l < file_list_571.txt)
-OUTPUT_DIR=shards-broad SHOTS_PER_BATCH=10 sbatch --array=0-$((N_FILES-1))%8 make_dataset.sh
+  # 1. Point at the new data directory. The default DATA_DIR in make_dataset.sh is
+  #    the old scraped_data path, but that's not actually referenced — it uses
+  #    file_list_571.txt directly. So just regenerate the list:
+  NEW_DIR=/sdf/data/ad/ard-online/FACET-II_Training_Data/2026-09-18
+  ls $NEW_DIR/*_571.h5 > file_list_571.txt
+  wc -l file_list_571.txt
+  N_FILES=$(wc -l < file_list_571.txt)
+  
+  # 2. Submit array job (WRAP_PHASE=1 and INPUT_FILTER=1 are defaults, keep them)
+  OUTPUT_DIR=shards-broad SHOTS_PER_BATCH=100 \
+      sbatch --array=0-$((N_FILES-1))%8 make_dataset.sh
+  
+  # 3. Monitor
+  squeue -u $USER
+  # When all tasks finish:
+  ls shards-broad/*.csv | wc -l           # should equal N_FILES
+  tail -n 3 logs/build571_*_*.out | tail -30   # spot-check no errors
+  
+  Then concat + validate
+  
+  bash concat_shards.sh shards-broad dataset-broad.csv
+  wc -l dataset-broad.csv
+
 
 bash concat_shards.sh shards-broad dataset-broad.csv
 
